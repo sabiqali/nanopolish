@@ -89,11 +89,14 @@ static const char *CONSENSUS_USAGE_MESSAGE =
 "  -o, --outfile=FILE                   write result to FILE [default: stdout]\n"
 "  -t, --threads=NUM                    use NUM threads (default: 1)\n"
 "  -m, --min-candidate-frequency=F      extract candidate variants from the aligned reads when the variant frequency is at least F (default 0.2)\n"
+"  -i, --indel-bias=F                   bias HMM transition parameters to favor insertions (F<1) or deletions (F>1).\n"
+"                                       this value is automatically set depending on --consensus, but can be manually set if spurious indels are called\n"
 "  -d, --min-candidate-depth=D          extract candidate variants from the aligned reads when the depth is at least D (default: 20)\n"
 "  -x, --max-haplotypes=N               consider at most N haplotype combinations (default: 1000)\n"
 "      --min-flanking-sequence=N        distance from alignment end to calculate variants (default: 30)\n"
 "      --max-rounds=N                   perform N rounds of consensus sequence improvement (default: 50)\n"
 "  -c, --candidates=VCF                 read variant candidates from VCF, rather than discovering them from aligned reads\n"
+"      --read-group=RG                  only use alignments with read group tag RG\n"
 "  -a, --alternative-basecalls-bam=FILE if an alternative basecaller was used that does not output event annotations\n"
 "                                       then use basecalled sequences from FILE. The signal-level events will still be taken from the -b bam.\n"
 "      --calculate-all-support          when making a call, also calculate the support of the 3 other possible bases\n"
@@ -114,6 +117,7 @@ namespace opt
     static std::string consensus_output;
     static std::string alternative_model_type = DEFAULT_MODEL_TYPE;
     static std::string alternative_basecalls_bam;
+    static std::string read_group;
     static double min_candidate_frequency = 0.2f;
     static int min_candidate_depth = 20;
     static int calculate_all_support = false;
@@ -134,7 +138,7 @@ namespace opt
     static std::vector<std::string> methylation_types;
 }
 
-static const char* shortopts = "r:b:g:t:w:o:e:m:c:d:a:x:q:p:v";
+static const char* shortopts = "r:b:g:t:w:o:e:m:c:d:a:x:q:p:i:v";
 
 enum { OPT_HELP = 1,
        OPT_VERSION,
@@ -153,7 +157,9 @@ enum { OPT_HELP = 1,
        OPT_P_SKIP_SELF,
        OPT_P_BAD,
        OPT_P_BAD_SELF,
-       OPT_MIN_FLANKING_SEQUENCE };
+       OPT_MIN_FLANKING_SEQUENCE,
+       OPT_READ_GROUP
+     };
 
 static const struct option longopts[] = {
     { "verbose",                   no_argument,       NULL, 'v' },
@@ -165,6 +171,7 @@ static const struct option longopts[] = {
     { "outfile",                   required_argument, NULL, 'o' },
     { "threads",                   required_argument, NULL, 't' },
     { "min-candidate-frequency",   required_argument, NULL, 'm' },
+    { "indel-bias",                required_argument, NULL, 'i' },
     { "min-candidate-depth",       required_argument, NULL, 'd' },
     { "max-haplotypes",            required_argument, NULL, 'x' },
     { "candidates",                required_argument, NULL, 'c' },
@@ -172,6 +179,7 @@ static const struct option longopts[] = {
     { "alternative-basecalls-bam", required_argument, NULL, 'a' },
     { "methylation-aware",         required_argument, NULL, 'q' },
     { "min-flanking-sequence",     required_argument, NULL, OPT_MIN_FLANKING_SEQUENCE },
+    { "read-group",                required_argument, NULL, OPT_READ_GROUP },
     { "effort",                    required_argument, NULL, OPT_EFFORT },
     { "max-rounds",                required_argument, NULL, OPT_MAX_ROUNDS },
     { "genotype",                  required_argument, NULL, OPT_GENOTYPE },
@@ -203,7 +211,9 @@ std::string get_single_contig_or_fail()
     }
 
     const char* name = faidx_iseq(fai, 0);
-    return std::string(name);
+    std::string ret(name);
+    fai_destroy(fai);
+    return ret;
 }
 
 int get_contig_length(const std::string& contig)
@@ -883,6 +893,10 @@ Haplotype call_variants_for_region(const std::string& contig, int region_start, 
         alignments.set_alternative_basecalls_bam(opt::alternative_basecalls_bam);
     }
 
+    if(!opt::read_group.empty()) {
+        alignments.set_read_group(opt::read_group);
+    }
+
     alignments.load_region(contig, region_start - BUFFER, region_end + BUFFER);
 
     // if the end of the region plus the buffer sequence goes past
@@ -996,10 +1010,13 @@ Haplotype call_variants_for_region(const std::string& contig, int region_start, 
     return called_haplotype;
 }
 
+extern double hmm_indel_bias_factor;
+
 void parse_call_variants_options(int argc, char** argv)
 {
     std::string methylation_motifs_str;
     bool die = false;
+    bool bias_override = false;
     for (char c; (c = getopt_long(argc, argv, shortopts, longopts, NULL)) != -1;) {
         std::istringstream arg(optarg != NULL ? optarg : "");
         switch (c) {
@@ -1010,6 +1027,7 @@ void parse_call_variants_options(int argc, char** argv)
             case 'w': arg >> opt::window; break;
             case 'o': arg >> opt::output_file; break;
             case 'm': arg >> opt::min_candidate_frequency; break;
+            case 'i': arg >> hmm_indel_bias_factor; bias_override = true; break;
             case 'd': arg >> opt::min_candidate_depth; break;
             case 'x': arg >> opt::max_haplotypes; break;
             case 'c': arg >> opt::candidates_file; break;
@@ -1034,6 +1052,7 @@ void parse_call_variants_options(int argc, char** argv)
             case OPT_P_BAD: arg >> g_p_bad; break;
             case OPT_P_BAD_SELF: arg >> g_p_bad_self; break;
             case OPT_MIN_FLANKING_SEQUENCE: arg >> opt::min_flanking_sequence; break;
+            case OPT_READ_GROUP: arg >> opt::read_group; break;
             case OPT_HELP:
                 std::cout << CONSENSUS_USAGE_MESSAGE;
                 exit(EXIT_SUCCESS);
@@ -1090,6 +1109,11 @@ void parse_call_variants_options(int argc, char** argv)
             const Alphabet* alphabet = get_alphabet_by_name(mtype);
             assert(alphabet != NULL);
         }
+    }
+
+    // set hmm indel bias, if not overridden
+    if(!bias_override) {
+        hmm_indel_bias_factor = opt::consensus_mode ? 0.9 : 0.8;    
     }
 
     if (die)
@@ -1168,6 +1192,10 @@ int call_variants_main(int argc, char** argv)
     header_fields.push_back(
         Variant::make_vcf_tag_string("INFO", "SupportFraction", 1, "Float",
                                       "The fraction of event-space reads that support the variant"));
+    
+    header_fields.push_back(
+            Variant::make_vcf_tag_string("INFO", "SupportFractionByStrand", 2, "Float",
+                "Fraction of event-space reads that support the variant for each strand"));
 
     header_fields.push_back(
         Variant::make_vcf_tag_string("INFO", "BaseCalledReadsWithVariant", 1, "Integer",
@@ -1180,6 +1208,22 @@ int call_variants_main(int argc, char** argv)
     header_fields.push_back(
             Variant::make_vcf_tag_string("INFO", "AlleleCount", 1, "Integer",
                 "The inferred number of copies of the allele"));
+
+    header_fields.push_back(
+            Variant::make_vcf_tag_string("INFO", "StrandSupport", 4, "Integer",
+                "Number of reads supporting the REF and ALT allele, by strand"));
+
+    header_fields.push_back(
+            Variant::make_vcf_tag_string("INFO", "StrandFisherTest", 1, "Integer",
+                "Strand bias fisher test"));
+    
+    header_fields.push_back(
+            Variant::make_vcf_tag_string("INFO", "SOR", 1, "Float",
+                "StrandOddsRatio test from GATK"));
+
+    header_fields.push_back(
+            Variant::make_vcf_tag_string("INFO", "RefContext", 1, "String",
+                "The reference sequence context surrounding the variant call"));
 
     if(opt::calculate_all_support) {
         header_fields.push_back(
@@ -1206,12 +1250,27 @@ int call_variants_main(int argc, char** argv)
     }
 
     // write the variants
-    for(const auto& v : haplotype.get_variants()) {
+    faidx_t *fai = fai_load(opt::genome_file.c_str());
+    for(auto& v : haplotype.get_variants()) {
 
         if(!opt::snps_only || v.is_snp()) {
+            int context_start_base = v.ref_position - 5;
+            if(context_start_base < 0) {
+                context_start_base = 0;
+            }
+            int context_end_base = v.ref_position + v.ref_seq.length() + 4;
+            if(context_end_base >= contig_length) {
+                context_end_base = contig_length - 1;
+            }
+  
+            int len;
+            std::string context = get_reference_region_ts(fai, v.ref_name.c_str(), context_start_base, context_end_base, &len);
+            v.add_info("RefContext", context);
             v.write_vcf(out_fp);
         }
     }
+    fai_destroy(fai);
+    fai = NULL;
 
     //
     if(out_fp != stdout) {

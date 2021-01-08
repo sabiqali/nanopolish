@@ -9,11 +9,14 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <sstream>
 #include "nanopolish_fast5_io.h"
 
 //#define DEBUG_FAST5_IO 1
 
 #define LEGACY_FAST5_RAW_ROOT "/Raw/Reads/"
+
+#define H5Z_FILTER_VBZ 32020 //We need to find out what the numerical value for this is
 
 int verbose = 0;
 
@@ -77,7 +80,7 @@ std::vector<std::string> fast5_get_multi_read_groups(fast5_file& fh)
     
         // copy the group name
         H5Lget_name_by_idx(fh.hdf5_file, "/", H5_INDEX_NAME, H5_ITER_INC, group_idx, buffer, buffer_size, H5P_DEFAULT);
-        buffer[size] = '\0';
+        buffer[size - 1] = '\0';
         out.push_back(buffer);
     }
 
@@ -144,6 +147,10 @@ raw_table fast5_get_raw_samples(fast5_file& fh, const std::string& read_id, fast
     status = H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, rawptr);
 
     if (status < 0) {
+	if(fast5_is_vbz_compressed(fh, read_id) == 1) {
+	    fprintf(stderr, "The fast5 file is compressed with VBZ but the required plugin is not loaded. Please read the instructions here: https://github.com/nanoporetech/vbz_compression/issues/5\n");
+	    exit(EXIT_FAILURE);
+	}
         free(rawptr);
 #ifdef DEBUG_FAST5_IO
         fprintf(stderr, "Failed to read raw data from dataset %s.\n", signal_path.c_str());
@@ -225,11 +232,48 @@ float fast5_read_float_attribute(hid_t group, const char *attribute) {
     return val;
 }
 
+uint64_t fast5_read_uint64_attribute(hid_t group, const char *attribute) {
+    uint64_t val = 0;
+    if (group < 0) {
+#ifdef DEBUG_FAST5_IO
+        fprintf(stderr, "Invalid group passed to %s:%d.", __FILE__, __LINE__);
+#endif
+        return val;
+    }
+
+    hid_t attr = H5Aopen(group, attribute, H5P_DEFAULT);
+    if (attr < 0) {
+#ifdef DEBUG_FAST5_IO
+        fprintf(stderr, "Failed to open attribute '%s' for reading.", attribute);
+#endif
+        return val;
+    }
+
+    H5Aread(attr, H5T_NATIVE_ULLONG, &val);
+    H5Aclose(attr);
+    return val;
+}
+
+uint64_t fast5_get_start_time(fast5_file& fh, const std::string& read_id)
+{
+    std::string raw_read_group = fast5_get_raw_read_group(fh, read_id);
+    hid_t group = H5Gopen(fh.hdf5_file, raw_read_group.c_str(), H5P_DEFAULT);
+    if (group < 0) {
+#ifdef DEBUG_FAST5_IO
+        fprintf(stderr, "Failed to open group %s\n", raw_read_group.c_str());
+#endif
+        return 0;
+    }
+    uint64_t t = fast5_read_uint64_attribute(group, "start_time");
+    H5Gclose(group);
+    return t;
+}
+
 //
 fast5_raw_scaling fast5_get_channel_params(fast5_file& fh, const std::string& read_id)
 {
     // from scrappie
-    fast5_raw_scaling scaling = { NAN, NAN, NAN, NAN };
+    fast5_raw_scaling scaling = { 0, NAN, NAN, NAN, NAN };
 
     std::string scaling_path = fh.is_multi_fast5 ? "/read_" + read_id + "/channel_id"
                                                  :  "/UniqueGlobalKey/channel_id";
@@ -241,6 +285,13 @@ fast5_raw_scaling fast5_get_channel_params(fast5_file& fh, const std::string& re
 #endif
         return scaling;
     }
+    
+    //TODO: open group once?
+
+    // channel
+    std::string tmp_id = fast5_get_string_attribute(fh, scaling_path, "channel_number");
+    std::stringstream parser(tmp_id);
+    parser >> scaling.channel_id;
 
     scaling.digitisation = fast5_read_float_attribute(scaling_group, "digitisation");
     scaling.offset = fast5_read_float_attribute(scaling_group, "offset");
@@ -399,4 +450,34 @@ close_group:
     H5Gclose(group);
 
     return out;
+}
+
+uint8_t fast5_is_vbz_compressed(fast5_file& fh, const std::string& read_id) {
+
+    hid_t dset, dcpl; 
+    H5Z_filter_t filter_id = 0;
+    char filter_name[80];
+    size_t nelmts = 1; /* number of elements in cd_values */
+    unsigned int values_out[1] = {99}; 
+    unsigned int flags;
+
+    // mostly from scrappie
+    std::string raw_read_group = fast5_get_raw_read_group(fh, read_id);
+
+    // Create data set name
+    std::string signal_path = raw_read_group + "/Signal";
+
+    dset = H5Dopen (fh.hdf5_file, signal_path.c_str(), H5P_DEFAULT);
+
+    dcpl = H5Dget_create_plist (dset);
+
+    filter_id = H5Pget_filter2 (dcpl, (unsigned) 0, &flags, &nelmts, values_out, sizeof(filter_name) - 1, filter_name, NULL);
+
+    H5Pclose (dcpl);
+    H5Dclose (dset);
+
+    if(filter_id == H5Z_FILTER_VBZ)
+        return 1;
+    else 
+        return 0;
 }

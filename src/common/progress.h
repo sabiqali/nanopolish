@@ -11,10 +11,12 @@
 
 #include <time.h>
 
+//#define HAVE_CLOCK_GETTIME 1
+
 class Progress
 {
     public:
-        
+
         Progress(const std::string message) : m_os(std::cerr), m_message(message)
         {
             timespec start;
@@ -26,7 +28,7 @@ class Progress
         void print(float progress) const
         {
 
-            // print 
+            // print
             unsigned max_leader = 40;
             unsigned bar_width = 50;
 
@@ -36,9 +38,9 @@ class Progress
             } else {
                 leader = m_message + std::string(max_leader - m_message.size(), ' '); // pad
             }
-            
+
             m_os << leader << " [";
-            
+
             unsigned pos = bar_width * progress;
             for (unsigned i = 0; i < bar_width; ++i) {
                 if (i < pos) m_os << "=";
@@ -48,8 +50,8 @@ class Progress
             m_os << "] " << unsigned(progress * 100.0) << "% in " << get_elapsed_seconds() << "s\r";
             m_os.flush();
         }
-        
-        // 
+
+        //
         void end() const
         {
             print(1.0);

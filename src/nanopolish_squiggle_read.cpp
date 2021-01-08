@@ -14,6 +14,7 @@
 #include "nanopolish_extract.h"
 #include "nanopolish_raw_loader.h"
 #include "nanopolish_fast5_io.h"
+#include "nanopolish_fast5_loader.h"
 
 extern "C" {
 #include "event_detection.h"
@@ -66,54 +67,61 @@ void SquiggleScalings::set6(double _shift,
 }
 
 //
-SquiggleRead::SquiggleRead(const std::string& name, const ReadDB& read_db, const uint32_t flags) :
-    read_name(name),
-    nucleotide_type(SRNT_DNA),
-    pore_type(PT_UNKNOWN),
-    f_p(nullptr)
+SquiggleRead::SquiggleRead(const std::string& name, const ReadDB& read_db, const uint32_t flags)
 {
-
-    this->events_per_base[0] = events_per_base[1] = 0.0f;
-    this->base_model[0] = this->base_model[1] = NULL;
-    this->fast5_path = read_db.get_signal_path(this->read_name);
+    this->fast5_path = read_db.get_signal_path(name);
     g_total_reads += 1;
     if(this->fast5_path == "") {
         g_bad_fast5_file += 1;
         return;
     }
 
-    // Get the read type from the fast5 file
-    fast5_file f5_file = fast5_open(fast5_path);
-    if(fast5_is_open(f5_file)) {
-
-        std::string sequencing_kit = fast5_get_sequencing_kit(f5_file, this->read_name);
-        std::string experiment_type = fast5_get_experiment_type(f5_file, this->read_name);
-        std::string flowcell_type = fast5_get_flowcell_type(f5_file, this->read_name);
-
-        // Try to detect whether this read is DNA or RNA
-        // Fix issue 531: experiment_type in fast5 is "rna" for cDNA kit dcs108
-        bool rna_experiment = experiment_type == "rna" || experiment_type == "internal_rna";
-        this->nucleotide_type = rna_experiment && sequencing_kit != "sqk-dcs108" ? SRNT_RNA : SRNT_DNA;
-
-        //fprintf(stderr, "fast5: %s detected flowcell type: %s\n", this->fast5_path.c_str(), flowcell_type.c_str());
-        // pre-release R10 uses "cust" flowcell type so we fall back to checking for
-        // the pore type in the path. this should be removed eventually once
-        // we no longer want to support pre-release R10
-        bool cust_or_unknown_fct = flowcell_type.empty() || flowcell_type == "cust-flo-m";
-        bool has_r10_path = this->fast5_path.find("r10") != std::string::npos;
-        if( flowcell_type == "flo-min110" || (cust_or_unknown_fct && has_r10_path )) {
-            this->pore_type = PT_R10;
-        } else {
-            this->pore_type = PT_R9;
-        }
-
-        this->read_sequence = read_db.get_read_sequence(read_name);
-        load_from_raw(f5_file, flags);
-
-        fast5_close(f5_file);
-
+    std::string sequence = read_db.get_read_sequence(name);
+    Fast5Data data = Fast5Loader::load_read(fast5_path, name);
+    if(data.is_valid && !sequence.empty()) {
+        init(sequence, data, flags);
     } else {
         fprintf(stderr, "[warning] fast5 file is unreadable and will be skipped: %s\n", fast5_path.c_str());
+        g_bad_fast5_file += 1;
+    }
+
+    if(!this->events[0].empty()) {
+        assert(this->base_model[0] != NULL);
+    }
+    free(data.rt.raw);
+    data.rt.raw = NULL;
+}
+
+SquiggleRead::SquiggleRead(const ReadDB& read_db, const Fast5Data& data, const uint32_t flags)
+{
+    init(read_db.get_read_sequence(data.read_name), data, flags);
+}
+
+SquiggleRead::SquiggleRead(const std::string& sequence, const Fast5Data& data, const uint32_t flags)
+{
+    init(sequence, data, flags);
+}
+
+//
+void SquiggleRead::init(const std::string& read_sequence, const Fast5Data& data, const uint32_t flags)
+{
+    this->nucleotide_type = SRNT_DNA;
+    this->pore_type = PT_UNKNOWN;
+    this->f_p = nullptr;
+
+    this->events_per_base[0] = events_per_base[1] = 0.0f;
+    this->base_model[0] = this->base_model[1] = NULL;
+    g_total_reads += 1;
+
+    this->read_name = data.read_name;
+    this->read_sequence = read_sequence;
+
+    // sometimes the basecaller will emit very short sequences, which causes problems
+    // also there can be rare issues with the signal in the fast5 and we want to skip
+    // such reads
+    if(this->read_sequence.length() > 20 && data.is_valid && data.rt.n > 0) {
+        load_from_raw(data, flags);
+    } else {
         g_bad_fast5_file += 1;
     }
 
@@ -156,21 +164,120 @@ int SquiggleRead::get_closest_event_to(int k_idx, uint32_t strand) const
 }
 
 //
-static detector_param const event_detection_r10 = {
-    .window_length1 = 4,
-    .window_length2 = 13,
-    .threshold1 = 1.52f,
-    .threshold2 = 3.91f,
-    .peak_height = 0.17f
-};
+/*void SquiggleRead::load_from_events(const uint32_t flags)
+{
+    assert(this->nucleotide_type != SRNT_RNA);
+
+    assert(f_p->is_open());
+    detect_pore_type();
+    detect_basecall_group();
+    assert(not basecall_group.empty());
+
+    read_sequence = f_p->get_basecall_seq(read_type, basecall_group);
+
+    // Load PoreModel for both strands
+    std::vector<EventRangeForBase> event_maps_1d[NUM_STRANDS];
+    std::string read_sequences_1d[NUM_STRANDS];
+
+    for (size_t si = 0; si < 2; ++si) {
+
+        // Do we want to load this strand?
+        if(! (read_type == SRT_2D || read_type == si) ) {
+            continue;
+        }
+
+        // Load the events for this strand
+        auto f5_events = f_p->get_basecall_events(si, basecall_group);
+
+        // copy events
+        events[si].resize(f5_events.size());
+        std::vector<double> p_model_states;
+
+        for(size_t ei = 0; ei < f5_events.size(); ++ei) {
+            auto const & f5_event = f5_events[ei];
+
+            events[si][ei] = { static_cast<float>(f5_event.mean),
+                               static_cast<float>(f5_event.stdv),
+                               f5_event.start,
+                               static_cast<float>(f5_event.length),
+                               static_cast<float>(log(f5_event.stdv))
+                             };
+            assert(f5_event.p_model_state >= 0.0 && f5_event.p_model_state <= 1.0);
+            p_model_states.push_back(f5_event.p_model_state);
+        }
+
+        // we need the 1D event map and sequence to calculate calibration parameters
+        // these will be copied into the member fields later if this is a 1D read,
+        // or discarded if this is a 2D read
+
+        // NB we use event_group in this call rather than basecall_group as we want the 1D basecalls that match the events
+        read_sequences_1d[si] = f_p->get_basecall_seq(si == 0 ? SRT_TEMPLATE : SRT_COMPLEMENT,
+                                                      f_p->get_basecall_1d_group(basecall_group));
+        event_maps_1d[si] = build_event_map_1d(read_sequences_1d[si], si, f5_events, 5);
+
+        // Constructing the event map can fail due to an albacore bug
+        // in this case, we have to set this strand to be invalid
+        if(!event_maps_1d[si].empty()) {
+            // run version-specific load
+            if(pore_type == PT_R7) {
+                _load_R7(si);
+            } else {
+                _load_R9(si, read_sequences_1d[si], event_maps_1d[si], p_model_states, flags);
+            }
+        } else {
+            events[si].clear();
+        }
+    }
+
+    // Build the map from k-mers of the read sequence to events
+    if(read_type == SRT_2D) {
+        if(pore_type == PT_R9) {
+            build_event_map_2d_r9();
+        } else {
+            assert(pore_type == PT_R7);
+            build_event_map_2d_r7();
+        }
+    } else {
+        assert(read_type < NUM_STRANDS);
+        this->base_to_event_map.swap(event_maps_1d[read_type]);
+    }
+
+    // Load raw samples if requested
+    if(flags & SRF_LOAD_RAW_SAMPLES) {
+
+        auto& sample_read_names = f_p->get_raw_samples_read_name_list();
+        if(sample_read_names.empty()) {
+            fprintf(stderr, "Error, no raw samples found\n");
+            exit(EXIT_FAILURE);
+        }
+
+        // we assume the first raw sample read is the one we're after
+        std::string sample_read_name = sample_read_names.front();
+
+        samples = f_p->get_raw_samples(sample_read_name);
+        sample_start_time = f_p->get_raw_samples_params(sample_read_name).start_time;
+
+        // retrieve parameters
+        auto channel_params = f_p->get_channel_id_params();
+        sample_rate = channel_params.sampling_rate;
+    }
+
+    // Filter poor quality reads that have too many "stays"
+    if(!events[0].empty() && events_per_base[0] > 5.0) {
+        g_qc_fail_reads += 1;
+        events[0].clear();
+        events[1].clear();
+    }
+}*/
 
 //
-void SquiggleRead::load_from_raw(fast5_file& f5_file, const uint32_t flags)
+void SquiggleRead::load_from_raw(const Fast5Data& fast5_data, const uint32_t flags)
 {
-    // File not in db, can't load
-    if(this->fast5_path == "" || this->read_sequence == "") {
-        return;
-    }
+
+    // Try to detect whether this read is DNA or RNA
+    // Fix issue 531: experiment_type in fast5 is "rna" for cDNA kit dcs108
+    bool rna_experiment = fast5_data.experiment_type == "rna" || fast5_data.experiment_type == "internal_rna";
+    this->nucleotide_type = rna_experiment && fast5_data.sequencing_kit != "sqk-dcs108" ? SRNT_RNA : SRNT_DNA;
 
     //
     this->read_type = SRT_TEMPLATE;
@@ -205,27 +312,18 @@ void SquiggleRead::load_from_raw(fast5_file& f5_file, const uint32_t flags)
     assert(this->base_model[strand_idx] != NULL);
 
     // Read the sample rate
-    auto channel_params = fast5_get_channel_params(f5_file, this->read_name);
-    this->sample_rate = channel_params.sample_rate;
+    this->sample_rate = fast5_data.channel_params.sample_rate;
+    this->channel_id = fast5_data.channel_params.channel_id;
+    this->sample_start_time = fast5_data.start_time;
 
-    // Read the actual samples
-    raw_table rt = fast5_get_raw_samples(f5_file, this->read_name, channel_params);
-    if(rt.n == 0) {
-        if(rt.raw != NULL) {
-            free(rt.raw);
-        }
-        return;
-    }
-
-    // trim using scrappie's internal method
+    // trim raw using scrappie's internal method
     // parameters taken directly from scrappie defaults
     int trim_start = 200;
     int trim_end = 10;
     int varseg_chunk = 100;
     float varseg_thresh = 0.0;
-    trim_and_segment_raw(rt, trim_start, trim_end, varseg_chunk, varseg_thresh);
-    event_table et = detect_events(rt, *ed_params);
-    assert(rt.n > 0);
+    trim_and_segment_raw(fast5_data.rt, trim_start, trim_end, varseg_chunk, varseg_thresh);
+    event_table et = detect_events(fast5_data.rt, *ed_params);
     assert(et.n > 0);
 
     //
@@ -245,10 +343,10 @@ void SquiggleRead::load_from_raw(fast5_file& f5_file, const uint32_t flags)
 
     if(flags & SRF_LOAD_RAW_SAMPLES) {
         this->sample_start_time = 0;
-        this->samples.resize(rt.n);
+        this->samples.resize(fast5_data.rt.n);
         for(size_t i = 0; i < this->samples.size(); ++i) {
-            assert(rt.start + i < rt.n);
-            this->samples[i] = rt.raw[rt.start + i];
+            assert(fast5_data.rt.start + i < fast5_data.rt.n);
+            this->samples[i] = fast5_data.rt.raw[fast5_data.rt.start + i];
         }
     }
 
@@ -257,10 +355,8 @@ void SquiggleRead::load_from_raw(fast5_file& f5_file, const uint32_t flags)
         std::reverse(this->events[strand_idx].begin(), this->events[strand_idx].end());
     }
 
-    // clean up scrappie raw and event tables
-    assert(rt.raw != NULL);
+    // clean up event tables
     assert(et.event != NULL);
-    free(rt.raw);
     free(et.event);
 
     // align events to the basecalled read

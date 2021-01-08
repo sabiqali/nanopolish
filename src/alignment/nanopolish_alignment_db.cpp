@@ -388,7 +388,7 @@ void AlignmentDB::load_region(const std::string& contig,
         exit(EXIT_FAILURE);
     }
 
-    m_region_end = std::min(stop_position, contig_length);
+    m_region_end = std::min(stop_position, contig_length - 1);
     
     assert(!m_region_contig.empty());
     assert(m_region_start >= 0);
@@ -453,7 +453,10 @@ BamHandles _initialize_bam_itr(const std::string& bam_filename,
 
     // load bam file
     handles.bam_fh = sam_open(bam_filename.c_str(), "r");
-    assert(handles.bam_fh != NULL);
+    if(handles.bam_fh == NULL) {
+        fprintf(stderr, "Error - could not open bam file %s for read\n", bam_filename.c_str());
+        exit(EXIT_FAILURE);
+    }
 
     // load bam index file
     hts_idx_t* bam_idx = sam_index_load(handles.bam_fh, bam_filename.c_str());
@@ -490,6 +493,19 @@ std::vector<SequenceAlignmentRecord> AlignmentDB::_load_sequence_by_region(const
         // skip records without sequence or ambiguously mapped reads
         if(handles.bam_record->core.l_qseq == 0 || handles.bam_record->core.qual < 20) {
             continue;
+        }
+
+        if(!this->m_read_group.empty()) {
+            uint8_t* tag_ptr = bam_aux_get(handles.bam_record, "RG");
+            if(tag_ptr == NULL) {
+                // no read group skip
+                continue;
+            }
+
+            char* rg_str = bam_aux2Z(tag_ptr);
+            if(rg_str != m_read_group) {
+                continue;
+            }
         }
 
         records.emplace_back(handles.bam_record);

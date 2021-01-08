@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#! /usr/bin/env python3
 
 import sys
 import csv
@@ -23,7 +23,7 @@ def update_call_stats(key, num_called_cpg_sites, is_methylated, sequence):
         sites[key].called_sites_methylated += num_called_cpg_sites
 
 parser = argparse.ArgumentParser( description='Calculate methylation frequency at genomic CpG sites')
-parser.add_argument('-c', '--call-threshold', type=float, required=False, default=2.5)
+parser.add_argument('-c', '--call-threshold', type=float, required=False, default=2.0)
 parser.add_argument('-s', '--split-groups', action='store_true')
 args, input_files = parser.parse_known_args()
 assert(args.call_threshold is not None)
@@ -42,7 +42,7 @@ for f in input_files:
         llr = float(record['log_lik_ratio'])
 
         # Skip ambiguous call
-        if abs(llr) < args.call_threshold:
+        if abs(llr) < args.call_threshold * num_sites:
             continue
         sequence = record['sequence']
 
@@ -69,7 +69,7 @@ for f in input_files:
 # header
 print("\t".join(["chromosome", "start", "end", "num_motifs_in_group", "called_sites", "called_sites_methylated", "methylated_frequency", "group_sequence"]))
 
-sorted_keys = sorted(sites.keys(), key = lambda x: x)
+sorted_keys = sorted(list(sites.keys()), key = lambda x: x)
 
 for key in sorted_keys:
     if sites[key].called_sites > 0:

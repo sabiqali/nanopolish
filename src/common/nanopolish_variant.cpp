@@ -9,6 +9,7 @@
 #include <map>
 #include <iterator>
 #include <iomanip>
+#include "fet.h"
 #include "nanopolish_profile_hmm.h"
 #include "nanopolish_variant.h"
 #include "nanopolish_haplotype.h"
@@ -234,8 +235,9 @@ void score_variant_group(VariantGroup& variant_group,
         std::stringstream ss;
         ss << input[i].read->read_name << ":" << input[i].strand;
         read_ids.push_back(ss.str());
+        variant_group.set_read_strand(ss.str(), input[i].rc);
     }
-  
+
     #pragma omp parallel for
     for(size_t ri = 0; ri < input.size(); ++ri) {
         for(size_t hi = 0; hi < haplotypes.size(); ++hi) {
@@ -244,7 +246,7 @@ void score_variant_group(VariantGroup& variant_group,
             // Expand the haplotype to contain all representations of this sequence by adding methylation
             std::vector<HMMInputSequence> sequences = generate_methylated_alternatives(current.first.get_sequence(), methylation_types);
             double score = profile_hmm_score_set(sequences, input[ri], alignment_flags);
-            
+
             #pragma omp critical
             {
                 variant_group.set_combination_read_score(current.second, read_ids[ri], score);
@@ -256,6 +258,21 @@ void score_variant_group(VariantGroup& variant_group,
 
 #if 0
 #endif
+}
+
+double calculate_sor(double ref_fwd, double ref_rev, double alt_fwd, double alt_rev)
+{
+    // to avoid zeros
+    ref_fwd += 1;
+    ref_rev += 1;
+    alt_fwd += 1;
+    alt_rev += 1;
+
+    double r = (ref_fwd * alt_rev) / (alt_fwd * ref_rev);
+    double sym_ratio = r + (1.0/r);
+    double ref_ratio = std::min(ref_fwd, ref_rev) / std::max(ref_fwd, ref_rev);
+    double alt_ratio = std::min(alt_fwd, alt_rev) / std::max(alt_fwd, alt_rev);
+    return log(sym_ratio) + log(ref_ratio) - log(alt_ratio);
 }
 
 std::vector<Variant> simple_call(VariantGroup& variant_group,
@@ -270,10 +287,10 @@ std::vector<Variant> simple_call(VariantGroup& variant_group,
 
     double log_2 = log(2);
 
-#ifdef DEBUG_HAPLOTYPE_SELECTION 
+#ifdef DEBUG_HAPLOTYPE_SELECTION
     fprintf(stderr, "Selecting haplotypes\n");
 #endif
-    
+
     // Get read data for this group
     const std::vector< std::pair<std::string, double>> group_reads = variant_group.get_read_sum_scores();
 
@@ -288,7 +305,7 @@ std::vector<Variant> simple_call(VariantGroup& variant_group,
 
         // The current combination is represented as a vector of haplotype IDs
         std::vector<size_t> current_set = vc_sets.get();
-        
+
         // Check if the current set consists of entirely of haplotypes without variants
         bool is_base_set = true;
         for(size_t i = 0; i < current_set.size(); ++i) {
@@ -322,13 +339,13 @@ std::vector<Variant> simple_call(VariantGroup& variant_group,
             */
             set_score += set_sum;
         }
-        
+
         if(is_base_set) {
             base_score = set_score;
             base_set = current_set;
         }
-        
-#ifdef DEBUG_HAPLOTYPE_SELECTION 
+
+#ifdef DEBUG_HAPLOTYPE_SELECTION
         fprintf(stderr, "Current set score: %.5lf\t", set_score);
         for(size_t i = 0; i < current_set.size(); ++i) {
             fprintf(stderr, "\t%zu:%.2lf", current_set[i], read_support[i]);
@@ -348,21 +365,50 @@ std::vector<Variant> simple_call(VariantGroup& variant_group,
         best_set = base_set;
     }
 
-    // Calculate the number of reads that support each variant allele
+    // Calculate strand bias metrics and the number of reads supporting each variant
+
+    // Calculate how many reads support the reference and alt allele on each strand
+    // this is input into the fisher exact test for strand bias
+    size_t total_variants = variant_group.get_num_variants();
+    DoubleMatrix read_variant_assignment;
+    allocate_matrix(read_variant_assignment, group_reads.size(), total_variants);
     std::vector<double> read_variant_support(variant_group.get_num_variants(), 0.0f);
+
     for(size_t vc_id = 0; vc_id < variant_group.get_num_combinations(); ++vc_id) {
 
         const VariantCombination& vc = variant_group.get_combination(vc_id);
-        
+
         for(size_t ri = 0; ri < group_reads.size(); ++ri) {
             const std::string& read_id = group_reads[ri].first;
             double read_sum = group_reads[ri].second;
             double read_haplotype_score = variant_group.get_combination_read_score(vc_id, read_id);
             double posterior_read_from_haplotype = exp(read_haplotype_score - read_sum);
 
-            for(size_t var_idx = 0; var_idx < vc.get_num_variants(); ++var_idx) {
-                read_variant_support[vc.get_variant_id(var_idx)] += posterior_read_from_haplotype;
+            for(size_t vi = 0; vi < vc.get_num_variants(); ++vi) {
+                size_t var_id = vc.get_variant_id(vi);
+                assert(var_id < total_variants);
+
+                // for strand bias
+                double curr = get(read_variant_assignment, ri, var_id);
+                set(read_variant_assignment, ri, var_id, curr + posterior_read_from_haplotype);
+
+                // for read support
+                read_variant_support[var_id] += posterior_read_from_haplotype;
             }
+        }
+    }
+
+    std::vector<std::vector<double> > allele_strand_support;
+    for(size_t var_idx = 0; var_idx < variant_group.get_num_variants(); ++var_idx) {
+        allele_strand_support.push_back({0, 0, 0, 0});
+
+        for(size_t ri = 0; ri < group_reads.size(); ++ri) {
+            const std::string& read_id = group_reads[ri].first;
+            size_t strand = variant_group.is_read_rc(read_id);
+            double pp_alt = get(read_variant_assignment, ri, var_idx);
+
+            allele_strand_support[var_idx][0 + strand] += (1 - pp_alt);
+            allele_strand_support[var_idx][2 + strand] += pp_alt;
         }
     }
 
@@ -377,7 +423,7 @@ std::vector<Variant> simple_call(VariantGroup& variant_group,
                 var_count += curr_vc.get_variant_id(k) == vi;
             }
         }
-        
+
         if( !(genotype_all_input_variants || var_count > 0)) {
             continue;
         }
@@ -392,6 +438,45 @@ std::vector<Variant> simple_call(VariantGroup& variant_group,
         v.add_info("AlleleCount", var_count);
         v.add_info("SupportFraction", read_variant_support[vi] / group_reads.size());
 
+        double ref_fwd = allele_strand_support[vi][0];
+        double ref_rev = allele_strand_support[vi][1];
+
+        double alt_fwd = allele_strand_support[vi][2];
+        double alt_rev = allele_strand_support[vi][3];
+
+        std::stringstream sfbs;
+        sfbs << ((double)alt_fwd / (ref_fwd + alt_fwd)) << ","
+             << ((double)alt_rev / (ref_rev + alt_rev));
+        v.add_info("SupportFractionByStrand", sfbs.str());
+
+        std::stringstream ssss;
+        ssss << (int)std::round(ref_fwd) << "," << (int)std::round(ref_rev) << ","
+             << (int)std::round(alt_fwd) << "," << (int)std::round(alt_rev);
+        v.add_info("StrandSupport", ssss.str());
+
+        double left, right, two;
+        kt_fisher_exact(ref_fwd, ref_rev,
+                        alt_fwd, alt_rev,
+                        &left, &right, &two);
+
+        int fisher_scaled = (int)(-4.343 * log(two) + .499);
+
+        // clamp when there's underflow
+        if(fisher_scaled < 0) {
+            fisher_scaled = 1000;
+        }
+        v.add_info("StrandFisherTest", fisher_scaled);
+
+        // GATK StrandOddsRatio from: https://gatk.broadinstitute.org/hc/en-us/articles/360036732071-StrandOddsRatio
+        double sor = calculate_sor(ref_fwd, ref_rev, alt_fwd, alt_rev);
+        v.add_info("SOR", sor);
+
+        /*
+        if(fisher_scaled > 30) {
+            v.filter = "StrandBias";
+        }
+        */
+
         if(group_reads.size() > 0) {
             v.genotype = make_genotype(var_count, ploidy);
         } else {
@@ -400,6 +485,7 @@ std::vector<Variant> simple_call(VariantGroup& variant_group,
 
         output_variants.push_back(v);
     }
+    free_matrix(read_variant_assignment);
 
     return output_variants;
 
