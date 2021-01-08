@@ -281,6 +281,7 @@ void SquiggleRead::load_from_raw(const Fast5Data& fast5_data, const uint32_t fla
 
     //
     this->read_type = SRT_TEMPLATE;
+    this->pore_type = PT_R9;
     std::string strand_str = "template";
     size_t strand_idx = 0;
 
@@ -290,11 +291,11 @@ void SquiggleRead::load_from_raw(const Fast5Data& fast5_data, const uint32_t fla
     size_t k = 6;
     const detector_param* ed_params = &event_detection_defaults;
 
-    if(this->pore_type == PT_R10) {
+    /*if(this->pore_type == PT_R10) {
         kit = "r10_450bps";
         k = 9;
         ed_params = &event_detection_r10;
-    }
+    }*/
 
     if(this->nucleotide_type == SRNT_RNA) {
         assert(this->pore_type == PT_R9);
